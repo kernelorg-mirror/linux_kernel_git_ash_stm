@@ -32,13 +32,15 @@
  * struct msc_window - multiblock mode window descriptor
  * @entry:	window list linkage (msc::win_list)
  * @pgoff:	page offset into the buffer that this window starts at
- * @nr_blocks:	number of blocks (pages) in this window
+ * @nr_blocks:	number of blocks in this window (<= @nr_pages)
+ * @nr_pages:	number of pages in this window
  * @sgt:	array of block descriptors
  */
 struct msc_window {
 	struct list_head	entry;
 	unsigned long		pgoff;
 	unsigned int		nr_blocks;
+	unsigned int		nr_pages;
 	struct msc		*msc;
 	struct sg_table		sgt;
 };
@@ -137,6 +139,12 @@ static inline struct msc_block_desc *
 msc_win_block(struct msc_window *win, unsigned int block)
 {
 	return sg_virt(&win->sgt.sgl[block]);
+}
+
+static inline size_t
+msc_win_actual_bsz(struct msc_window *win, unsigned int block)
+{
+	return win->sgt.sgl[block].length;
 }
 
 static inline dma_addr_t
@@ -779,26 +787,26 @@ err_nomem:
 /**
  * msc_buffer_win_alloc() - alloc a window for a multiblock mode
  * @msc:	MSC device
- * @nr_blocks:	number of pages in this window
+ * @nr_pages:	number of pages in this window
  *
  * This modifies msc::win_list and msc::base, which requires msc::buf_mutex
  * to serialize, so the caller is expected to hold it.
  *
  * Return:	0 on success, -errno otherwise.
  */
-static int msc_buffer_win_alloc(struct msc *msc, unsigned int nr_blocks)
+static int msc_buffer_win_alloc(struct msc *msc, unsigned int nr_pages)
 {
 	struct msc_window *win;
 	int ret = -ENOMEM, i;
 
-	if (!nr_blocks)
+	if (!nr_pages)
 		return 0;
 
 	/*
 	 * This limitation hold as long as we need random access to the
 	 * block. When that changes, this can go away.
 	 */
-	if (nr_blocks > SG_MAX_SINGLE_ALLOC)
+	if (nr_pages > SG_MAX_SINGLE_ALLOC)
 		return -EINVAL;
 
 	win = kzalloc(sizeof(*win), GFP_KERNEL);
@@ -812,11 +820,10 @@ static int msc_buffer_win_alloc(struct msc *msc, unsigned int nr_blocks)
 							  struct msc_window,
 							  entry);
 
-		/* This works as long as blocks are page-sized */
-		win->pgoff = prev->pgoff + prev->nr_blocks;
+		win->pgoff = prev->pgoff + prev->nr_pages;
 	}
 
-	ret = __msc_buffer_win_alloc(win, nr_blocks);
+	ret = __msc_buffer_win_alloc(win, nr_pages);
 	if (ret < 0)
 		goto err_nomem;
 
@@ -827,6 +834,7 @@ static int msc_buffer_win_alloc(struct msc *msc, unsigned int nr_blocks)
 #endif
 
 	win->nr_blocks = ret;
+	win->nr_pages = nr_pages;
 
 	if (list_empty(&msc->win_list)) {
 		msc->base = msc_win_block(win, 0);
@@ -834,7 +842,7 @@ static int msc_buffer_win_alloc(struct msc *msc, unsigned int nr_blocks)
 	}
 
 	list_add_tail(&win->entry, &msc->win_list);
-	msc->nr_pages += nr_blocks;
+	msc->nr_pages += nr_pages;
 
 	return 0;
 
@@ -870,7 +878,7 @@ static void msc_buffer_win_free(struct msc *msc, struct msc_window *win)
 {
 	int i;
 
-	msc->nr_pages -= win->nr_blocks;
+	msc->nr_pages -= win->nr_pages;
 
 	list_del(&win->entry);
 	if (list_empty(&msc->win_list)) {
@@ -936,7 +944,7 @@ static void msc_buffer_relink(struct msc *msc)
 			}
 
 			bdesc->sw_tag = sw_tag;
-			bdesc->block_sz = PAGE_SIZE / 64;
+			bdesc->block_sz = msc_win_actual_bsz(win, blk) / 64;
 		}
 	}
 
@@ -1095,19 +1103,31 @@ static int msc_buffer_free_unless_used(struct msc *msc)
 static struct page *msc_buffer_get_page(struct msc *msc, unsigned long pgoff)
 {
 	struct msc_window *win;
+	unsigned int blk;
 
 	if (msc->mode == MSC_MODE_SINGLE)
 		return msc_buffer_contig_get_page(msc, pgoff);
 
 	list_for_each_entry(win, &msc->win_list, entry)
-		if (pgoff >= win->pgoff && pgoff < win->pgoff + win->nr_blocks)
+		if (pgoff >= win->pgoff && pgoff < win->pgoff + win->nr_pages)
 			goto found;
 
 	return NULL;
 
 found:
 	pgoff -= win->pgoff;
-	return sg_page(&win->sgt.sgl[pgoff]);
+
+	for (blk = 0; blk < win->nr_blocks; blk++) {
+		struct page *page = sg_page(&win->sgt.sgl[blk]);
+		size_t pgsz = win->sgt.sgl[blk].length >> PAGE_SHIFT;
+
+		if (pgoff < pgsz)
+			return page + pgoff;
+
+		pgoff -= pgsz;
+	}
+
+	return NULL;
 }
 
 /**
@@ -1481,7 +1501,7 @@ nr_pages_show(struct device *dev, struct device_attribute *attr, char *buf)
 	else if (msc->mode == MSC_MODE_MULTI) {
 		list_for_each_entry(win, &msc->win_list, entry) {
 			count += scnprintf(buf + count, PAGE_SIZE - count,
-					   "%d%c", win->nr_blocks,
+					   "%d%c", win->nr_pages,
 					   msc_is_last_win(win) ? '\n' : ',');
 		}
 	} else {
