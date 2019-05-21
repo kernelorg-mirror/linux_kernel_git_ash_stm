@@ -703,6 +703,11 @@ static int msc_win_set_lockout(struct msc_window *win, int expect, int new)
 	if (expect == WIN_LOCKED && old == new)
 		return 0;
 
+	if (old == expect && new == WIN_LOCKED)
+		atomic_inc(&win->msc->user_count);
+	else if (old == expect && old == WIN_LOCKED)
+		atomic_dec(&win->msc->user_count);
+
 	if (WARN_ONCE(old != expect, "expected lockout state %d, got %d\n",
 		      expect, old))
 		return -EINVAL;
